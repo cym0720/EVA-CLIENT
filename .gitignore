@@ -27,6 +27,8 @@ datasets/
 work_dirs/
 logs/
 Log/
+python3.10.INFO
+python3.10.log.*
 
 # Local helpers are ignored except maintained tool packages.
 tools/*

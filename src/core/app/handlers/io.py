@@ -377,17 +377,78 @@ def fetch_action_chunk(
     rate = runtime.transport.create_rate(config.inference_cfg.publish_rate)
     while not runtime.transport.is_shutdown():
         observation = prebuilt_observation
+        observation_source = runtime.inference_observation_source
+        current_frame = observation_source.frame_index if observation_source is not None else None
         if observation is None:
-            frame = runtime.transport.get_frame()
+            # live 模式从策略 reader 读取完整观测；回放模式则从选中的数据集读取。
+            # 对 live G2 来说，这一帧同时带有图像和原始关节组；下面由
+            # build_policy_observation 将 state_qpos 放入策略输入的 state 字段。
+            frame = (
+                observation_source.get_frame()
+                if observation_source is not None
+                else runtime.transport.get_frame()
+            )
             if frame is None:
+                if observation_source is not None:
+                    raise RuntimeError("Policy observation dataset is exhausted")
                 rate.sleep()
                 continue
             observation = build_policy_observation(frame, prompt, config, runtime)
+        if (
+            observation_source is not None
+            and current_frame is not None
+            and current_frame > 0
+            and runtime.policy_metadata
+            and runtime.policy_metadata.get("sequential_chunks")
+        ):
+            # Stateful servers advance cache for the complete response chunk. If the
+            # next recorded observation advances by fewer actions, discard that cache;
+            # if the full chunk was executed, keep it aligned with the dataset frame.
+            server_chunk_size = int(runtime.policy_metadata.get("chunk_size", 0) or 0)
+            configured_horizon = getattr(runtime.infer_strategy, "execute_horizon", None)
+            partial_chunk = server_chunk_size <= 0 or (
+                configured_horizon is not None
+                and int(configured_horizon) < server_chunk_size
+            )
+            if partial_chunk:
+                runtime.policy.reset()
+                logger.info(
+                    "[POLICY_OBSERVATION_DATASET] reset sequential cache at source_frame=%d "
+                    "execute_horizon=%s server_chunk_size=%d",
+                    current_frame,
+                    configured_horizon,
+                    server_chunk_size,
+                )
         infer_start = time.monotonic()
         if runtime.policy is None:
             raise RuntimeError("Policy client is unavailable")
+        dataset_cfg = config.inference_cfg.get("observation_dataset") or {}
+        use_live_state = observation_source is not None and bool(
+            dataset_cfg.get("use_live_state", False)
+        )
+        if use_live_state:
+            if config.inference_cfg.obs_space.is_eef():
+                raise ValueError(
+                    "observation_dataset.use_live_state requires JointState observations"
+                )
+            live_state = runtime.transport.get_latest_qpos()
+            if live_state is None:
+                raise RuntimeError("Live joint state is unavailable for dataset-image inference")
+            live_state = np.array(live_state, dtype=np.float32, copy=True)
+            expected_shape = (runtime.robot.total_action_dim,)
+            if live_state.shape != expected_shape or not np.isfinite(live_state).all():
+                raise RuntimeError(
+                    f"Live joint state must be finite with shape {expected_shape}, "
+                    f"got {live_state.shape}"
+                )
+            observation = {**observation, "state": live_state}
         logger.debug("[INFER] prompt=%r", prompt)
-        response = runtime.policy.infer(observation)
+        policy_observation = _policy_observation_for_inference(
+            observation,
+            black_images=bool(config.inference_cfg.get("black_policy_images", False)),
+            is_dataset_observation=observation_source is not None,
+        )
+        response = runtime.policy.infer(policy_observation)
         infer_ms = 1000.0 * (time.monotonic() - infer_start)
         if session is not None:
             session.last_infer_ms = infer_ms
@@ -399,12 +460,54 @@ def fetch_action_chunk(
         action_chunk = normalize_policy_action_chunk(
             config, runtime, original_chunk, response=response
         )
+        observation_source = runtime.inference_observation_source
+        if observation_source is not None:
+            configured_horizon = getattr(runtime.infer_strategy, "execute_horizon", None)
+            horizon = min(
+                len(action_chunk),
+                max(1, int(configured_horizon))
+                if configured_horizon is not None
+                else len(action_chunk),
+            )
+            source_frames_per_action = max(
+                1,
+                int(round(observation_source.fps / max(config.inference_cfg.publish_rate, 1))),
+            )
+            stride = source_frames_per_action * horizon
+            assert current_frame is not None
+            observation_source.seek(current_frame + stride)
+            dataset_limit = (observation_source.n_steps // stride) * horizon
+            configured_limit = int(config.inference_cfg.get("max_run_frames", 0) or 0)
+            runtime.inference_observation_max_run_frames = (
+                min(dataset_limit, configured_limit)
+                if configured_limit > 0
+                else dataset_limit
+            )
+            logger.info(
+                "[POLICY_OBSERVATION_DATASET] input_frame=%d next_frame=%d stride=%d "
+                "control_horizon=%d max_run_frames=%d state_source=%s",
+                current_frame,
+                current_frame + stride,
+                stride,
+                horizon,
+                runtime.inference_observation_max_run_frames,
+                "live" if use_live_state else "dataset",
+            )
         runtime.robot.snap_grippers(
             action_chunk,
             config.robot.gripper_threshold,
             config.robot.gripper_open,
             config.robot.gripper_close,
         )
+        trace = runtime.policy_observation_trace
+        if trace is not None and current_frame is not None:
+            trace_horizon = getattr(runtime.infer_strategy, "execute_horizon", None)
+            trace_chunk = (
+                action_chunk[: max(1, int(trace_horizon))]
+                if trace_horizon is not None
+                else action_chunk
+            )
+            trace.add_chunk(current_frame, trace_chunk)
         step_index = session.step_index if session is not None else -1
         logger.debug(
             "[INFER_CHUNK] step=%d infer_ms=%.1f raw_shape=%s action_shape=%s "
@@ -421,9 +524,33 @@ def fetch_action_chunk(
     raise SystemExit(0)
 
 
+def _policy_observation_for_inference(
+    observation: dict[str, Any], *, black_images: bool, is_dataset_observation: bool
+) -> dict[str, Any]:
+    """Return an inference-only observation, optionally replacing images with zeros.
+
+    Keep the source observation intact for the UI, recording, and other consumers.
+    """
+    if not black_images or not is_dataset_observation:
+        return observation
+
+    inference_observation = dict(observation)
+    images = observation.get("images")
+    if images is not None:
+        inference_observation["images"] = {
+            name: np.zeros_like(image) for name, image in images.items()
+        }
+    return inference_observation
+
+
 def _loop_observation(config: ConfigDict, runtime: RuntimeState, prompt: str) -> dict | None:
     """Build a policy observation from the latest frame; None if none is available."""
-    frame = runtime.transport.get_frame()
+    observation_source = runtime.inference_observation_source
+    frame = (
+        observation_source.get_frame()
+        if observation_source is not None
+        else runtime.transport.get_frame()
+    )
     if frame is None:
         return None
     return build_policy_observation(frame, prompt, config, runtime)
@@ -448,10 +575,15 @@ def start_inference_loop(config: ConfigDict, runtime: RuntimeState, session: Ses
         return
 
     prompt = session.selected_task
+    sequential_chunks = bool(
+        isinstance(runtime.policy_metadata, dict)
+        and runtime.policy_metadata.get("sequential_chunks")
+    )
     runtime.infer_strategy.start_loop(
         prompt,
         partial(_loop_fetch_chunk, config, runtime, session),
         partial(_loop_observation, config, runtime, prompt),
+        wait_for_buffer_empty=sequential_chunks,
     )
 
 
@@ -467,6 +599,29 @@ def run_warmup_and_start(config: ConfigDict, runtime: RuntimeState, session: Ses
     we skip the N pre-inferences and only anchor the buffer + start the loop.
     """
     assert session.selected_task is not None
+
+    if runtime.inference_observation_source is not None:
+        if runtime.policy_observation_trace is not None:
+            try:
+                runtime.policy_observation_trace.save()
+            except Exception:
+                logger.exception("Could not finalize the previous policy observation report")
+            runtime.policy_observation_trace = None
+        runtime.inference_observation_source.seek(0)
+        runtime.inference_observation_max_run_frames = 0
+        from core.app.policy_observation_report import PolicyObservationTrace
+
+        runtime.policy_observation_trace = PolicyObservationTrace(
+            runtime.inference_observation_source,
+            runtime.eval_output_dir or ".",
+            config.inference_cfg.publish_rate,
+            config.robot.gripper_open,
+            config.robot.gripper_close,
+            inference_horizon=max(
+                1,
+                int(getattr(runtime.infer_strategy, "execute_horizon", None) or 1),
+            ),
+        )
 
     replay = runtime.replay_source
     if replay is not None:
@@ -492,6 +647,47 @@ def run_warmup_and_start(config: ConfigDict, runtime: RuntimeState, session: Ses
     session.action_chunk = None
     session.chunk_index = 0
     _anchor_buffer_to_current_qpos(runtime)
+
+    # Stateful chunk servers advance their internal rolling cache on every request.
+    # Reset after setup's validation inference, then reuse this first chunk for actual
+    # execution so the server's cache and the robot's executed actions stay aligned.
+    sequential_chunks = bool(
+        isinstance(runtime.policy_metadata, dict)
+        and runtime.policy_metadata.get("sequential_chunks")
+    )
+    if sequential_chunks and runtime.policy is not None:
+        try:
+            runtime.policy.reset()
+            if runtime.infer_strategy is None:
+                chunk = fetch_action_chunk(config, runtime, session.selected_task, session)
+                session.action_chunk = chunk
+            else:
+                chunk = runtime.infer_strategy.prepare_warmup_chunk(
+                    session.selected_task,
+                    partial(_loop_fetch_chunk, config, runtime, session),
+                )
+                if runtime.infer_strategy.runs_background_loop:
+                    # Execute this first chunk from the async buffer. The background
+                    # loop is gated on the buffer emptying before it requests another.
+                    session.action_chunk = None
+                else:
+                    session.action_chunk = chunk
+            session.chunk_index = 0
+        except PolicyRequestError as error:
+            invalidate_policy_connection(config, runtime, session, error)
+            runtime.setup_stage = ""
+            return False
+        except Exception as error:
+            reset_run_state(config, runtime, session)
+            session.last_error = f"Warmup failed: {error}"
+            runtime.setup_stage = ""
+            logger.info("Warmup failed: %s", error)
+            return False
+        logger.info("Stateful policy reset; first %d-action chunk is ready", len(chunk))
+        runtime.setup_stage = ""
+        if runtime.infer_strategy is not None and runtime.infer_strategy.runs_background_loop:
+            start_inference_loop(config, runtime, session)
+        return True
 
     if skip_warmup:
         logger.info("Eval fast-path: skipping per-trial warmup")
@@ -802,6 +998,88 @@ def _build_replay_dataset_config(
     return new_config
 
 
+def load_policy_observation_dataset(
+    dataset_dir: str,
+    episode_id: int,
+    config: ConfigDict,
+    runtime: RuntimeState,
+) -> None:
+    """Mount LeRobot observations as policy input while keeping the live transport.
+
+    Unlike REPLAY, this source only supplies observations to ``policy.infer``. The
+    primary transport remains connected to the robot and continues to receive the
+    inferred action commands.
+    """
+    dataset_dir = str(_resolve_runtime_path(dataset_dir))
+    io = LeRobotDatasetIO(dataset_dir)
+    n_episodes = io.count_episodes()
+    if not 0 <= episode_id < n_episodes:
+        raise ValueError(f"Episode {episode_id} out of range (0..{n_episodes - 1})")
+
+    inferred = io.infer_keys()
+    state_key = (inferred.get("state") or {}).get("default") or "observation.state"
+    action_key = (inferred.get("action") or {}).get("default") or "action"
+    image = inferred.get("image") or {}
+    candidates = list(image.get("candidates") or [])
+    video_keys: dict[str, str] = {}
+    for camera in runtime.robot.observation_schema.cameras:
+        cam_key = camera.observation_key
+        match = next(
+            (
+                candidate
+                for candidate in candidates
+                if candidate == f"observation.images.{cam_key}"
+                or candidate.endswith(f".{cam_key}")
+            ),
+            None,
+        )
+        if match is not None:
+            video_keys[cam_key] = match
+
+    dataset_config = _build_replay_dataset_config(
+        config,
+        dataset_dir,
+        episode_id,
+        state_key,
+        action_key,
+        "",
+        video_keys,
+    )
+    source = DatasetTransport(dataset_config, runtime.robot, dataset_dir, episode_id)
+    state = source.get_obs_state(0)
+    expected_dim = runtime.robot.total_action_dim
+    if state.shape != (expected_dim,):
+        source.close()
+        raise ValueError(
+            f"Dataset state has shape {state.shape}; expected ({expected_dim},) for G2"
+        )
+    expected_cameras = {
+        camera.observation_key for camera in runtime.robot.observation_schema.cameras
+    }
+    missing_cameras = expected_cameras - set(source.available_camera_keys())
+    if missing_cameras:
+        source.close()
+        raise ValueError(f"Dataset is missing policy cameras: {sorted(missing_cameras)}")
+
+    previous = runtime.inference_observation_source
+    if previous is not None:
+        previous.close()
+    runtime.inference_observation_source = source
+    runtime.inference_observation_max_run_frames = 0
+    logger.info(
+        "[POLICY_OBSERVATION_DATASET] ready path=%s episode=%d frames=%d fps=%d "
+        "state_key=%s cameras=%s task=%s execute=%s",
+        dataset_dir,
+        episode_id,
+        source.n_steps,
+        source.fps,
+        state_key,
+        list(source.available_camera_keys()),
+        format_task_label(source.current_task),
+        bool(config.inference_cfg.get("observation_dataset", {}).get("execute", False)),
+    )
+
+
 def _is_eef_action_key(key: str) -> bool:
     normalized = key.lower().replace(".", "_").replace("/", "_")
     return normalized in {"action_eef", "actions_eef"} or (
@@ -1028,6 +1306,7 @@ __all__ = [
     "_build_replay_dataset_config",
     "_is_eef_action_key",
     "_resolve_replay_dataset_action_key",
+    "load_policy_observation_dataset",
     "load_replay_dataset",
     "clear_replay",
     "set_replay_fps",

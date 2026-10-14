@@ -95,9 +95,11 @@ class BaseInferStrategy:
         prompt: str,
         fetch_chunk: FetchChunkFn,
         get_observation: ObservationFn,
+        *,
+        wait_for_buffer_empty: bool = False,
     ) -> None:
         """Start continuous inference loop. No-op for sync strategies."""
-        _ = prompt, fetch_chunk, get_observation
+        _ = prompt, fetch_chunk, get_observation, wait_for_buffer_empty
 
     def stop_loop(self) -> None:
         """Stop continuous inference loop. No-op for sync strategies."""
@@ -185,10 +187,15 @@ class BackgroundLoopInferStrategy(BaseInferStrategy):  # pyright: ignore[reportG
         prompt: str,
         fetch_chunk: FetchChunkFn,
         get_observation: ObservationFn,
+        *,
+        wait_for_buffer_empty: bool = False,
     ) -> None:
-        """Start the background inference thread that prefetches chunks into the buffer.
+        """Start the background inference thread that fills the action buffer.
 
         No-op if a loop thread is already alive.
+        When ``wait_for_buffer_empty`` is true, fetch a new chunk only after the
+        current buffered chunk has been consumed. Stateful policy servers use this
+        to keep their rolling cache aligned with the executed action chunks.
 
         Args:
             prompt: Task instruction passed to the policy each iteration.
@@ -201,15 +208,22 @@ class BackgroundLoopInferStrategy(BaseInferStrategy):  # pyright: ignore[reportG
             self._stop_event.clear()
             self._loop_thread = threading.Thread(
                 target=self._inference_loop,
-                args=(self._generation, prompt, fetch_chunk, get_observation),
+                args=(
+                    self._generation,
+                    prompt,
+                    fetch_chunk,
+                    get_observation,
+                    wait_for_buffer_empty,
+                ),
                 name=self._thread_name,
                 daemon=True,
             )
             self._loop_thread.start()
             logger.info(
-                "Started %s inference loop at %.1f Hz",
+                "Started %s inference loop at %.1f Hz wait_for_buffer_empty=%s",
                 self._log_label,
                 self.inference_rate,
+                wait_for_buffer_empty,
             )
 
     def stop_loop(self) -> None:
@@ -252,11 +266,15 @@ class BackgroundLoopInferStrategy(BaseInferStrategy):  # pyright: ignore[reportG
         prompt: str,
         fetch_chunk: FetchChunkFn,
         get_observation: ObservationFn,
+        wait_for_buffer_empty: bool = False,
     ) -> None:
         interval = 1.0 / max(self.inference_rate, 0.1)
         while not self._stop_event.is_set():
             if generation != self._generation:
                 return
+            if wait_for_buffer_empty and self._smooth_buffer.has_actions():
+                self._stop_event.wait(0.01)
+                continue
             observation_started = time.monotonic()
             obs = get_observation()
             observation_done = time.monotonic()

@@ -4,7 +4,13 @@ _base_ = ["agibot_g2.py"]
 
 console = dict(initial_tab="collect")
 
+inference_cfg = dict(publish_rate=10)
+
 collection = dict(
+    storage=dict(
+        log_dir="/data/collection/agibot_g2",
+        fps=10,
+    ),
     teleop=dict(
         _delete_=True,
         control_source="client",

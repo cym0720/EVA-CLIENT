@@ -36,6 +36,9 @@ transport = dict(
     image_layout="chw",
     sub_endpoint="tcp://127.0.0.1:5555",
     pub_endpoint="tcp://127.0.0.1:5556",
+    # ZMQ: enable only when each message contains every camera and joint group.
+    # Live readers keep the newest snapshot; recording still keeps every frame.
+    conflate_observations=False,
     disabled_cameras=[],
     disabled_groups=[],
     dataset_keys=dict(
@@ -161,6 +164,13 @@ control_channel = dict(
 
 eval_cfg = {}  # Empty dict marks a non-eval config; eval configs fill this block.
 
+# Real-robot dataset replay setup. The deployment default resets to home before
+# interpolating to the episode's first recorded pose.
+replay_cfg = dict(
+    reset_to_home=True,
+    start_transition_steps=100,
+)
+
 # RL workspace configuration. Empty keeps the RL tab unavailable; dedicated RL
 # launch configs provide tasks, policy/critic choices, and data settings.
 rl_cfg = {}
@@ -193,6 +203,8 @@ inference_cfg = dict(
     action_space=dict(type="JointState"),
     inference_rate=3.0,
     publish_rate=30,
+    # Replace dataset-observation policy-server images with zeros when enabled.
+    black_policy_images=False,
     max_debug_time_s=300.0,
     setup_warmup_chunks=2,
     debug_tasks=["pour soybean", "put cup"],

@@ -83,18 +83,24 @@ so its state/camera layout matches the real one.
 
 ## Run on Real Hardware
 
-Run it on the robot host before starting EVA:
+On the G2 host with the platform GDK installed under `/home/agi/app`, load its
+runtime paths and launch the adapter with the G2-compatible Python 3.10
+environment. The SDK binary is built for CPython 3.10; the adapter also needs
+the EVA source tree on `PYTHONPATH`:
 
 ```bash
-python examples/hardware/agibot_g2/node.py \
+source /home/agi/app/env.sh
+export PYTHONPATH="$PWD/src:$PYTHONPATH"
+examples/hardware/agibot_g2/.venv/bin/python examples/hardware/agibot_g2/node.py \
   --obs-endpoint tcp://127.0.0.1:5555 \
   --action-endpoint tcp://127.0.0.1:5556
-eva --config configs/01_deploy/agibot_g2/openpi_qpos.py --web-port 8080
 ```
 
+This platform environment is separate from EVA's Python 3.11 venv. `env.sh`
+adds `/home/agi/app/gdk/lib` and the platform shared libraries needed by GDK.
 `node.py` takes only the two endpoint arguments, both defaulting to the EVA
-presets. Open the EVA web console (e.g. `http://127.0.0.1:8080`) in a browser,
-not the ZMQ ports.
+presets. Start EVA in another terminal. Open its web console (e.g.
+`http://127.0.0.1:8080`) in a browser, not the ZMQ ports.
 
 ### Mocking the GDK
 

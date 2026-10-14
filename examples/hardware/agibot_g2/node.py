@@ -125,6 +125,8 @@ class AgibotHardwareNode:
         return cv2.imdecode(img_array, cv2.IMREAD_COLOR)
 
     def _observation_loop(self):
+        # 每次发布一条完整快照：把三路相机当前可取得的图像和新读取的 GDK 关节状态
+        # 放在同一条消息中。``t`` 标记这条快照的生成时刻，不是各相机各自的曝光时间。
         period = 1.0 / self._obs_hz
         next_tick = time.monotonic()
 
@@ -137,6 +139,8 @@ class AgibotHardwareNode:
                 images[key_name] = img
 
             current_qpos = self._read_current_qpos()
+            # 按执行器组保存原始电机位置；EVA 后续会按机器人 schema 的
+            # state_composition 顺序把这些数组拼成策略输入 state。
             state_dict = {
                 "left_arm": current_qpos[0:8],
                 "right_arm": current_qpos[8:16],

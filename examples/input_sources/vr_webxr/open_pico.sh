@@ -13,6 +13,12 @@ fi
 
 PICO_SERIAL="${1:-${PICO_SERIAL:-}}"
 VR_TOKEN="${VR_TOKEN:-}"
+VR_MODE="${VR_MODE:-ar}"
+
+if [[ "$VR_MODE" != "ar" && "$VR_MODE" != "vr" ]]; then
+  echo "VR_MODE must be ar or vr." >&2
+  exit 2
+fi
 
 if [[ -z "$VR_TOKEN" ]]; then
   echo "VR_TOKEN is required; use the token printed by the WebXR node." >&2
@@ -49,7 +55,7 @@ if [[ "$(adb -s "$PICO_SERIAL" get-state 2>/dev/null || true)" != "device" ]]; t
 fi
 
 readonly PORT=43876
-readonly VR_URL="http://127.0.0.1:${PORT}/?token=${VR_TOKEN}&mode=ar&reload=$(date +%s)"
+readonly VR_URL="http://127.0.0.1:${PORT}/?token=${VR_TOKEN}&mode=${VR_MODE}&reload=$(date +%s)"
 
 echo "Using PICO device: $PICO_SERIAL"
 adb -s "$PICO_SERIAL" reverse "tcp:${PORT}" "tcp:${PORT}"

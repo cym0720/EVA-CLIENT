@@ -5,6 +5,7 @@ from __future__ import annotations
 import collections
 import sys
 import threading
+import time
 import types
 from typing import cast
 
@@ -31,7 +32,7 @@ from transport.zmq import (
 )
 
 
-def _build_zmq_transport_with_fake_readers(monkeypatch):
+def _build_zmq_transport_with_fake_readers(monkeypatch, *, conflate_observations=False):
     readers = []
 
     class _Reader:
@@ -108,6 +109,7 @@ def _build_zmq_transport_with_fake_readers(monkeypatch):
             sub_endpoint="tcp://127.0.0.1:5555",
             pub_endpoint="tcp://127.0.0.1:5556",
             image_mode="stream",
+            conflate_observations=conflate_observations,
         )
     )
     robot = types.SimpleNamespace(name="test_robot")
@@ -161,6 +163,126 @@ def test_observation_reader_enables_conflate_before_connect():
         ("setsockopt", fake_zmq.RCVTIMEO, 0),
         ("connect", config.transport.sub_endpoint),
     ]
+
+
+@pytest.mark.parametrize("conflate_observations", [False, True])
+def test_zmq_latest_readers_preserve_collection_backlog(monkeypatch, conflate_observations):
+    transport, readers, _ = _build_zmq_transport_with_fake_readers(
+        monkeypatch, conflate_observations=conflate_observations
+    )
+    transport.create_observation_reader()
+
+    assert [reader.conflate for reader in readers] == [
+        conflate_observations,
+        False,
+        conflate_observations,
+        conflate_observations,
+    ]
+    assert readers[1].preserve_collection_backlog
+
+
+def test_zmq_live_frames_stay_current_after_idle_and_slow_decode(monkeypatch):
+    from unittest.mock import Mock
+
+    from core.app.handlers.io import fetch_action_chunk
+    from core.app.state import RuntimeState
+    from core.config import load_config
+
+    zmq = pytest.importorskip("zmq")
+    robot = ROBOT_REGISTRY.build("agibot_g2")
+    camera_keys = [camera.observation_key for camera in robot.observation_schema.cameras]
+    publisher = zmq.Context.instance().socket(zmq.XPUB)
+    publisher.setsockopt(zmq.XPUB_VERBOSE, 1)
+    port = publisher.bind_to_random_port("tcp://127.0.0.1")
+    config = ConfigDict(
+        transport=ConfigDict(
+            sub_endpoint=f"tcp://127.0.0.1:{port}",
+            pub_endpoint=f"inproc://unused-action-{port}",
+            disabled_cameras=[],
+            disabled_groups=[],
+            conflate_observations=True,
+        )
+    )
+    transport = ZmqTransport(config, robot)
+    policy = types.SimpleNamespace(
+        infer=Mock(return_value={"actions": np.zeros((16, robot.total_action_dim))})
+    )
+    runtime = RuntimeState(robot=robot, transport=transport, policy=policy)
+    pipeline_config = load_config("configs/01_deploy/agibot_g2/agibot_g2_v1_h20_live.py")
+
+    def publish(index):
+        publisher.send(
+            pack_observation(
+                WireObservation(
+                    t=float(index),
+                    images={key: np.full((4, 4, 3), index, dtype=np.uint8) for key in camera_keys},
+                    state={
+                        group.name: np.full(group.dof, index, dtype=np.float32)
+                        for group in robot.actuator_groups
+                    },
+                )
+            )
+        )
+
+    try:
+        # XPUB acknowledgements ensure all three readers are subscribed before sending.
+        for _ in range(3):
+            assert publisher.poll(1500, zmq.POLLIN)
+            assert publisher.recv() == b"\x01"
+        publish(1)
+        assert transport._reader._sub.poll(1500, zmq.POLLIN)
+        first = transport.get_frame()
+        assert first is not None and first.timestamp == 1.0
+
+        # The control reader is idle while whole snapshots advance, as during SETUP
+        # and execution of a 16-action chunk. Slow decoding must not replay old frames.
+        for index in range(2, 65):
+            publish(index)
+        time.sleep(0.1)
+        original_unpack = zmq_transport.unpack_observation
+
+        def slow_unpack(payload):
+            time.sleep(0.03)
+            return original_unpack(payload)
+
+        with monkeypatch.context() as slow_decode:
+            slow_decode.setattr(zmq_transport, "unpack_observation", slow_unpack)
+            frame = transport.get_frame()
+        assert frame is not None and frame.timestamp == 64.0
+        np.testing.assert_array_equal(frame.state_qpos, np.full(robot.total_action_dim, 64))
+        for image in frame.images.values():
+            np.testing.assert_array_equal(image, np.full((4, 4, 3), 64, dtype=np.uint8))
+        assert set(frame.images) == set(camera_keys)
+        fetch_action_chunk(pipeline_config, runtime, "fresh observation test")
+        sent = policy.infer.call_args.args[0]
+        np.testing.assert_array_equal(sent["state"], frame.state_qpos)
+        assert set(sent["images"]) == set(camera_keys)
+        for image in sent["images"].values():
+            assert image.shape == (224, 224, 3)
+            assert image.dtype == np.uint8
+            assert np.all(image == 64)
+
+        for index in range(65, 129):
+            publish(index)
+        time.sleep(0.1)
+        frame = transport.get_frame()
+        assert frame is not None and frame.timestamp == 128.0
+        np.testing.assert_array_equal(frame.state_qpos, np.full(robot.total_action_dim, 128))
+        np.testing.assert_array_equal(transport.get_latest_qpos(), frame.state_qpos)
+        fetch_action_chunk(pipeline_config, runtime, "fresh observation test")
+        np.testing.assert_array_equal(
+            policy.infer.call_args.args[0]["state"], np.full(robot.total_action_dim, 128)
+        )
+        assert policy.infer.call_count == 2
+
+        # Recording still receives the original sequence, including pre-read frames.
+        recorded_first = transport.get_collection_frame()
+        recorded_second = transport.get_collection_frame()
+        assert recorded_first is not None and recorded_first.timestamp == 1.0
+        assert recorded_second is not None and recorded_second.timestamp == 2.0
+    finally:
+        transport.close()
+        publisher.close(linger=0)
 
 
 def test_observation_roundtrip_preserves_images_state_and_timestamp():
@@ -624,6 +746,39 @@ def test_zmq_reader_keeps_multi_camera_visualization_cache():
     np.testing.assert_array_equal(cam_high_frame, cam_high)
     np.testing.assert_array_equal(cam_left_frame, cam_left)
     assert reader.get_camera_frame("cam_right_wrist") is None
+
+
+@pytest.mark.parametrize("decode_seconds", [0.0, 0.03])
+def test_zmq_reader_yields_when_publisher_never_runs_out(monkeypatch, decode_seconds):
+    robot = ROBOT_REGISTRY.build("agilex_piper")
+    state = {group.name: np.zeros(group.dof, dtype=np.float32) for group in robot.actuator_groups}
+    clock = [0.0]
+    received = [0]
+    monkeypatch.setattr(zmq_transport.time, "monotonic", lambda: clock[0])
+
+    class _Sub:
+        def recv(self, _flags):
+            received[0] += 1
+            assert received[0] <= zmq_transport.COLLECTION_SOCKET_DRAIN_MAX
+            clock[0] += decode_seconds
+            return pack_observation(WireObservation(t=float(received[0]), images={}, state=state))
+
+    reader = object.__new__(_ObservationReader)
+    reader._sub = _Sub()
+    reader._zmq = types.SimpleNamespace(NOBLOCK=object(), Again=RuntimeError)
+    reader._latest = None
+    reader._latest_images = {}
+    reader._disabled_cameras = set()
+    reader._image_rate = ImageRateTracker()
+    reader._freshness = types.SimpleNamespace(mark=lambda: None)
+    reader._lock = threading.Lock()
+
+    obs = reader._drain_latest()
+    assert obs is not None
+    assert obs.t == received[0]
+    assert received[0] == (2 if decode_seconds else zmq_transport.COLLECTION_SOCKET_DRAIN_MAX)
+    assert reader._lock.acquire(blocking=False)
+    reader._lock.release()
 
 
 def test_zmq_reader_combines_full_rate_state_with_cached_camera_frames():

@@ -580,6 +580,53 @@ def test_async_warmup_leaves_prefetched_action_ready(monkeypatch):
     np.testing.assert_allclose(action, runtime.transport.latest_qpos)
 
 
+def test_stateful_async_warmup_starts_chunk_gated_loop(monkeypatch):
+    from strategy.async_strategy import AsyncLinearOverlapInferStrategy
+
+    class _StatefulPolicy:
+        metadata = {"sequential_chunks": True, "chunk_size": 16}
+
+        def __init__(self) -> None:
+            self.reset_calls = 0
+
+        def reset(self) -> None:
+            self.reset_calls += 1
+
+    strategy = AsyncLinearOverlapInferStrategy(
+        execute_horizon=16,
+        inference_rate=3.0,
+        latency_k=0,
+    )
+    runtime, session = _runtime_and_session()
+    runtime.infer_strategy = strategy
+    runtime.policy = _StatefulPolicy()
+    runtime.policy_metadata = runtime.policy.metadata
+    session.selected_task = "pick"
+    config = _config()
+    config.eval = None
+    config.inference_cfg.setup_warmup_chunks = 1
+    chunk = np.arange(32, dtype=np.float32).reshape(16, 2)
+    loop_options = []
+    monkeypatch.setattr(io, "reset_ik_solver", lambda *_args: None)
+    monkeypatch.setattr(io, "fetch_action_chunk", lambda *_args, **_kwargs: chunk.copy())
+    monkeypatch.setattr(
+        strategy,
+        "start_loop",
+        lambda *_args, **kwargs: loop_options.append(kwargs),
+    )
+
+    assert io.run_warmup_and_start(config, runtime, session) is True
+
+    assert runtime.policy.reset_calls == 1
+    assert session.action_chunk is None
+    assert loop_options == [{"wait_for_buffer_empty": True}]
+    actions = [strategy.pop_next_action() for _ in range(16)]
+    assert all(action is not None for action in actions)
+    # The first chunk is buffered once and the background loop will wait for these
+    # actions to drain before requesting the next stateful server chunk.
+    assert strategy.pop_next_action() is None
+
+
 def test_rollout_ui_save_stops_collection_and_persists_whole_episode():
     runtime, session = _runtime_and_session()
     episode_logger = _RolloutLifecycleLogger()

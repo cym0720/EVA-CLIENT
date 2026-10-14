@@ -78,6 +78,37 @@ def test_build_async_defaults():
     assert strategy.exp_weight_m == 0.01
 
 
+def test_async_sequential_loop_waits_for_buffer_to_drain():
+    strategy = AsyncLinearOverlapInferStrategy(inference_rate=100.0, latency_k=0)
+    strategy._smooth_buffer.integrate_new_chunk(
+        np.array([[1.0], [2.0]], dtype=np.float32)
+    )
+    requested = threading.Event()
+    requests = []
+
+    def fetch_chunk(_prompt, _observation):
+        requests.append(True)
+        requested.set()
+        return np.array([[3.0], [4.0]], dtype=np.float32)
+
+    strategy.start_loop(
+        "pick",
+        fetch_chunk,
+        lambda: {},
+        wait_for_buffer_empty=True,
+    )
+    try:
+        time.sleep(0.05)
+        assert requests == []
+        assert strategy.pop_next_action() is not None
+        assert strategy.pop_next_action() is not None
+        assert requested.wait(timeout=1.0)
+        time.sleep(0.05)
+        assert len(requests) == 1
+    finally:
+        strategy.stop_loop()
+
+
 def test_build_negative_inference_rate_clamped():
     strategy = _build({"type": "AsyncLinearOverlapInferStrategy", "args": {}}, rate=-5.0)
     assert strategy.inference_rate == 0.0

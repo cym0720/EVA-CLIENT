@@ -130,6 +130,7 @@ class SessionState:
     last_error: str = ""
     last_infer_ms: float = 0.0
     run_start_time: float = 0.0
+    run_frame_start_index: int = 0
 
 
 @dataclasses.dataclass
@@ -264,6 +265,9 @@ class RuntimeState:
     eval_output_dir: str = ""
     active_config: ConfigDict | None = None
     replay_source: DatasetTransport | None = None
+    inference_observation_source: DatasetTransport | None = None
+    inference_observation_max_run_frames: int = 0
+    policy_observation_trace: Any | None = None
     replay_dataset_dir: str = ""
     replay_episode_id: int = 0
     replay_n_episodes: int = 0

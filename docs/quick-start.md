@@ -2,6 +2,9 @@
 
 # 🚀 Quick start
 
+For the current G2 host's MANUAL and USB WebXR workflow, see
+[G2 手动控制与 VR 遥操作](agibot-g2-operation.md).
+
 The entry point is `eva` (`../src/main.py`). `--config` is required and points to a
 `.py` config; everything else is operated from the browser.
 

@@ -409,6 +409,26 @@ def publish_real_action_with_preview(
         )
 
 
+def limit_policy_qpos_step(
+    config: ConfigDict, runtime: RuntimeState, action: np.ndarray
+) -> np.ndarray:
+    """Limit one policy target's per-joint delta from the latest measured qpos."""
+    limit = float(config.inference_cfg.get("max_policy_qpos_step", 0.0) or 0.0)
+    if limit <= 0.0:
+        return action
+    current = runtime.transport.get_latest_qpos()
+    if current is None:
+        raise RuntimeError("Cannot apply the configured policy qpos limit without live qpos")
+    current = np.asarray(current, dtype=np.float32).reshape(-1)
+    target = np.asarray(action, dtype=np.float32).reshape(-1)
+    if current.shape != target.shape:
+        raise RuntimeError(
+            "Policy qpos limit expects matching vectors, "
+            f"got current={current.shape}, target={target.shape}"
+        )
+    return current + np.clip(target - current, -limit, limit)
+
+
 def publish_action_chunk(
     config: ConfigDict,
     runtime: RuntimeState,
@@ -686,15 +706,18 @@ def reset_with_setup(
 
 
 def transition_to_first_frame(
-    config: ConfigDict, runtime: RuntimeState, session: SessionState
+    config: ConfigDict,
+    runtime: RuntimeState,
+    session: SessionState,
+    steps: int = 100,
 ) -> bool:
     """Smoothly move the real robot from its current qpos to the replay's first frame.
 
-    Real-robot replay starts from home (after reset), but the recorded trajectory's
-    first pose is usually elsewhere; jumping straight to it would snap the arm. This
-    linearly interpolates over the overlapping dims (qpos feedback width may exceed the
-    recorded action width — non-overlapping dims hold their current value) and streams
-    the transition to the real robot before frame-by-frame replay begins.
+    The recorded trajectory's first pose may differ from the robot's current pose;
+    jumping straight to it would snap the arm. This linearly interpolates over the
+    overlapping dims (qpos feedback width may exceed the recorded action width —
+    non-overlapping dims hold their current value) and streams the transition to the
+    real robot before frame-by-frame replay begins.
 
     Returns False if interrupted, True otherwise (including when nothing to do).
     """
@@ -709,7 +732,7 @@ def transition_to_first_frame(
     target = np.asarray(current_qpos, dtype=np.float32).copy()
     overlap = min(target.shape[0], first_qpos.shape[0])
     target[:overlap] = first_qpos[:overlap]
-    trajectory = build_linear_trajectory(current_qpos, target, steps=100)
+    trajectory = build_linear_trajectory(current_qpos, target, steps=max(1, int(steps)))
     set_setup_stage(runtime, "moving to trajectory start")
     rate = runtime.transport.create_rate(config.inference_cfg.publish_rate)
     for action in trajectory:
@@ -760,13 +783,18 @@ def run_setup(
         if session.mode in (SessionMode.REAL, SessionMode.STEP) and not is_offline_transport(
             runtime
         ):
-            set_setup_stage(runtime, "resetting to home position")
-            if not reset_with_setup(config, runtime, session, OutputTarget.REAL):
-                session.last_error = "Setup interrupted during reset trajectory"
-                set_setup_stage(runtime, "")
-                return False
+            replay_cfg = config.get("replay_cfg") or {}
+            if replay_cfg.get("reset_to_home", True):
+                set_setup_stage(runtime, "resetting to home position")
+                if not reset_with_setup(config, runtime, session, OutputTarget.REAL):
+                    session.last_error = "Setup interrupted during reset trajectory"
+                    set_setup_stage(runtime, "")
+                    return False
             reset_ik_solver(config, runtime)
-            if not transition_to_first_frame(config, runtime, session):
+            transition_steps = int(replay_cfg.get("start_transition_steps", 100))
+            if not transition_to_first_frame(
+                config, runtime, session, steps=transition_steps
+            ):
                 session.last_error = "Setup interrupted while moving to trajectory start"
                 set_setup_stage(runtime, "")
                 return False
@@ -1007,6 +1035,7 @@ def publish_next_action(config: ConfigDict, runtime: RuntimeState, session: Sess
         if action is None:
             return False  # buffer empty, skip this tick
         action = apply_gripper_control_overrides(runtime, action, session)
+        action = limit_policy_qpos_step(config, runtime, action)
         override_done = time.monotonic()
         logger.debug(
             "[PUBLISH_ACTION] mode=%s strategy=loop step=%d action=%s",
@@ -1021,6 +1050,11 @@ def publish_next_action(config: ConfigDict, runtime: RuntimeState, session: Sess
             record_executed_action(config, session, action, runtime)
         else:
             publish_real_action_with_preview(config, runtime, action, session=session)
+        if runtime.policy_observation_trace is not None:
+            runtime.policy_observation_trace.record_command(
+                session.step_index - session.run_frame_start_index,
+                action,
+            )
         publish_done = time.monotonic()
         if publish_done - started >= 0.02:
             logger.warning(
@@ -1042,6 +1076,7 @@ def publish_next_action(config: ConfigDict, runtime: RuntimeState, session: Sess
     action = apply_gripper_control_overrides(
         runtime, session.action_chunk[session.chunk_index], session
     )
+    action = limit_policy_qpos_step(config, runtime, action)
     logger.debug(
         "[PUBLISH_ACTION] mode=%s strategy=chunk step=%d chunk=%d/%d action=%s",
         session.mode.value,
@@ -1056,6 +1091,16 @@ def publish_next_action(config: ConfigDict, runtime: RuntimeState, session: Sess
         record_executed_action(config, session, action, runtime)
     else:
         publish_real_action_with_preview(config, runtime, action, session=session)
+    if runtime.policy_observation_trace is not None:
+        runtime.policy_observation_trace.record_command(
+            session.step_index - session.run_frame_start_index,
+            action,
+        )
+
+    # Count the frame as soon as EVA has sent the command. A synchronous arrival wait
+    # may be interrupted afterward, but it must not hide an already-published frame
+    # from the run limit or the console's progress counter.
+    session.step_index += 1
 
     is_sync = strategy is not None and not strategy.runs_background_loop
     if is_sync and strategy is not None and not is_offline_transport(runtime):
@@ -1073,7 +1118,6 @@ def publish_next_action(config: ConfigDict, runtime: RuntimeState, session: Sess
             return False
 
     session.chunk_index += 1
-    session.step_index += 1
     return True
 
 

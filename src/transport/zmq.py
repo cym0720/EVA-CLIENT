@@ -56,6 +56,9 @@ HIL_ACK_TIMEOUT_S = 1.0
 class WireObservation:
     """One timestamped sensor frame published by an execution-layer node.
 
+    G2 发布端会把图像和关节组放进同一条消息。这样 live 策略输入可以使用同一条
+    收到的快照中的图像和 state，而不必从单独的关节反馈 reader 再取 state。
+
     Args:
         t: capture timestamp in seconds (monotonic at the source).
         images: observation_key -> [H, W, 3] uint8 array.
@@ -271,8 +274,9 @@ class _ObservationReader:
     Each reader owns its own SUB socket connected to the same PUB endpoint, so the
     pub/sub fan-out delivers a full copy of every observation to each reader — a
     visualization reader and the control-loop reader never steal frames from one
-    another. A lock guards drain/_latest because the console serves frames from
-    multiple HTTP worker threads against a single reader.
+    另一个 reader 不会抢走它的消息；每个 reader 的接收队列也彼此独立。因此，预览图像
+    很新并不能证明策略 reader 也读到了新 state。控制台的多个 HTTP worker 可能同时访问
+    同一个 reader，所以用锁保护 drain 和 _latest。
     """
 
     def __init__(
@@ -313,20 +317,29 @@ class _ObservationReader:
         ctx = zmq_mod.Context.instance()
         self._sub = ctx.socket(zmq_mod.SUB)
         if conflate:
-            # Collection capture only consumes the freshest complete observation.
-            # Conflation prevents an idle reader from replaying pre-START frames
-            # that are still buffered below the application-level drain.
+            # Complete snapshots carry every camera and joint group together.
+            # Keep only the latest snapshot while the consumer is idle, instead of
+            # replaying old frames after setup or a multi-action chunk.
+            # Partial-camera streams must leave this disabled to retain their cache.
             self._sub.setsockopt(zmq_mod.CONFLATE, 1)
         self._sub.setsockopt(zmq_mod.SUBSCRIBE, b"")
         self._sub.setsockopt(zmq_mod.RCVTIMEO, 0)  # non-blocking drain
         self._sub.connect(config.transport.sub_endpoint)
 
     def _drain_latest(self) -> WireObservation | None:
-        """Pop all queued SUB messages, keeping only the newest by timestamp."""
+        """有限量地读取消息，并保留本次读到的最新时间戳和图像缓存。
+
+        未开启 ``conflate`` 时，这里的“最新”只表示本次读取到的消息中时间戳最新，
+        不一定是发布端刚发出的最新消息。G2 开启 ZMQ CONFLATE，避免闲置的 live
+        reader 在逐条追赶不断增长的 FIFO 旧消息队列。
+        """
         with self._lock:
             newest = self._latest
             got_message = False
-            while True:
+            # A continuously publishing camera source can outpace decoding. Do not
+            # hold the shared reader lock indefinitely while HTTP workers wait.
+            deadline = time.monotonic() + 0.05
+            for _ in range(COLLECTION_SOCKET_DRAIN_MAX):
                 try:
                     payload = self._sub.recv(self._zmq.NOBLOCK)
                 except self._zmq.Again:
@@ -337,6 +350,8 @@ class _ObservationReader:
                 self._cache_images_locked(obs)
                 if newest is None or obs.t >= newest.t:
                     newest = obs
+                if time.monotonic() >= deadline:
+                    break
             if got_message:
                 self._freshness.mark()
             self._latest = newest
@@ -444,6 +459,9 @@ class _ObservationReader:
             [state_dim] float32, or None if no frame is available or a required
             camera/group is missing.
         """
+        # 当前 reader 同时负责组装策略帧中的图像和关节状态。drain 会更新图像缓存，
+        # 下面则从 ``wire_obs.state`` 取关节状态。G2 每条消息都是完整快照并启用了
+        # CONFLATE，因此返回的图像与 state 对应最新待处理的那条快照。
         wire_obs = self._drain_latest()
         if wire_obs is None:
             return None
@@ -459,6 +477,8 @@ class _ObservationReader:
                 return None
             images[camera.observation_key] = np.asarray(image)
 
+        # state 不存在 _latest_images 里；它来自这条 WireObservation，按机器人声明的
+        # 策略输入顺序逐组取出并拼接。
         state_parts: list[np.ndarray] = []
         for group_name in self._robot.observation_schema.state_composition:
             if group_name in self._disabled_groups:
@@ -490,6 +510,8 @@ class _ObservationReader:
         key so visualization can keep all camera panes alive when the execution
         layer publishes cameras independently.
         """
+        # 控制台预览通过独立的辅助 SUB reader 调用这里。它有自己的队列和图像缓存，
+        # 不提供策略输入中的 state。
         wire_obs = self._drain_latest()
         if wire_obs is not None:
             self._cache_images(wire_obs)
@@ -710,14 +732,22 @@ class ZmqTransport(TransportBridge):
         self._closed = False
         self._zmq = zmq
 
-        self._reader = _ObservationReader(config, robot, zmq)
+        self._conflate_observations = bool(
+            getattr(config.transport, "conflate_observations", False)
+        )
+        # 策略 reader 和关节反馈 reader 各自从 PUB/SUB 收到一份消息副本。G2 发布的是
+        # 完整快照，因此两者都启用只保留最新帧；下面的采集 reader 单独保留，保证录制
+        # 时仍按顺序保存每一帧。
+        self._reader = _ObservationReader(config, robot, zmq, conflate=self._conflate_observations)
         self._collection_reader = _ObservationReader(
             config,
             robot,
             zmq,
             preserve_collection_backlog=True,
         )
-        self._qpos_reader = _ObservationReader(config, robot, zmq)
+        self._qpos_reader = _ObservationReader(
+            config, robot, zmq, conflate=self._conflate_observations
+        )
         self._extra_readers: list[_ObservationReader] = []
 
         ctx = zmq.Context.instance()
@@ -725,10 +755,11 @@ class ZmqTransport(TransportBridge):
         self._pub.connect(config.transport.pub_endpoint)
 
         logger.info(
-            "ZMQ transport ready: sub=%s pub=%s robot=%s",
+            "ZMQ transport ready: sub=%s pub=%s robot=%s obs_latest_only=%s",
             config.transport.sub_endpoint,
             config.transport.pub_endpoint,
             robot.name,
+            self._conflate_observations,
         )
 
     def get_frame(self) -> Observation | None:
@@ -889,7 +920,12 @@ class ZmqTransport(TransportBridge):
 
     def create_observation_reader(self) -> _ObservationReader:
         """Create and track an independent reader (own SUB socket) for an aux consumer."""
-        reader = _ObservationReader(self._config, self._robot, self._zmq)
+        reader = _ObservationReader(
+            self._config,
+            self._robot,
+            self._zmq,
+            conflate=self._conflate_observations,
+        )
         self._extra_readers.append(reader)
         return reader
 

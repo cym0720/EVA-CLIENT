@@ -204,13 +204,23 @@ async function boot() {
     S.CFG = await apiGet("/api/config");
     initDashboard();
     installCollectKeyboardControls();
-    renderConfig();
     // EVAL/RESULT use inline onclick handlers; expose them.
     window.tpToggle = tpToggle; window.tpSeek = tpSeek;
     window.trialPopClose = trialPopClose;
-    const s = await apiGet("/api/status");
-    applyStatus(s);
-    renderRlStatus(s);
+    // Read the backend mode before rendering defaults: reloading a REAL setup
+    // must not enqueue SIM and interrupt the robot's reset trajectory.
+    let initialStatus = null;
+    try {
+      initialStatus = await apiGet("/api/status");
+      S.STATUS = initialStatus;
+    } catch (error) {
+      console.warn("Initial EVA status unavailable; polling will retry", error);
+    }
+    renderConfig();
+    if (initialStatus) {
+      applyStatus(initialStatus);
+      renderRlStatus(initialStatus);
+    }
     if (!collectConfigured()) {
       document.querySelector('.tab[data-tab="collect"]').classList.add("disabled");
     }

@@ -41,6 +41,7 @@ from core.app.handlers import (
     ingest_client_teleop_action,
     is_replay,
     iter_target_grippers,
+    load_policy_observation_dataset,
     load_replay_dataset,
     manual_home,
     manual_send,
@@ -1106,6 +1107,14 @@ def _dispatch_run(config: ConfigDict, runtime: RuntimeState, session: SessionSta
     """Mode-specific run/step: start continuous publishing for REAL/SIM, or preview/
     commit a chunk for STEP. Shared by the web run/start verbs and the queue's ``s`` verb.
     """
+    observation_dataset = config.inference_cfg.get("observation_dataset") or {}
+    if (
+        runtime.inference_observation_source is not None
+        and session.mode in (SessionMode.REAL, SessionMode.STEP)
+        and not observation_dataset.get("execute", False)
+    ):
+        session.last_error = "Real execution is disabled; relaunch EVA with --execute"
+        return
     if session.mode is SessionMode.SELECT:
         session.last_error = "Select mode first: 1.real  2.sim  3.sim_real"
         return
@@ -1134,6 +1143,7 @@ def _dispatch_run(config: ConfigDict, runtime: RuntimeState, session: SessionSta
             if runtime.rollout_episode_logger is None:
                 start_episode(runtime, session)
         session.run_start_time = time.monotonic()
+        session.run_frame_start_index = session.step_index
         set_status(session, SessionStatus.RUNNING, reason="start")
         return
     if session.pending_real_chunk is None:
@@ -1281,6 +1291,21 @@ def run(
         selected_inference_strategy_key=None,
         infer_strategy=None,
     )
+    observation_dataset_cfg = config.inference_cfg.get("observation_dataset") or {}
+    if observation_dataset_cfg:
+        dataset_dir = str(observation_dataset_cfg.get("dataset_dir", "")).strip()
+        if not dataset_dir:
+            raise ValueError("inference_cfg.observation_dataset.dataset_dir is required")
+        load_policy_observation_dataset(
+            dataset_dir,
+            int(observation_dataset_cfg.get("episode_id", 0)),
+            config,
+            runtime,
+        )
+        assert runtime.inference_observation_source is not None
+        dataset_task = runtime.inference_observation_source.current_task
+        if dataset_task:
+            session.selected_task = dataset_task
     runtime.hil_control_mode = str(
         getattr(
             transport,
@@ -1480,6 +1505,38 @@ def run(
                     now=running_tick,
                 ):
                     continue
+                max_run_frames = int(effective.inference_cfg.get("max_run_frames", 0) or 0)
+                dataset_frame_limit = int(runtime.inference_observation_max_run_frames or 0)
+                if dataset_frame_limit > 0:
+                    max_run_frames = (
+                        min(max_run_frames, dataset_frame_limit)
+                        if max_run_frames > 0
+                        else dataset_frame_limit
+                    )
+                frames_this_run = session.step_index - session.run_frame_start_index
+                if max_run_frames > 0 and frames_this_run >= max_run_frames:
+                    logger.info(
+                        "[MAX_RUN_FRAMES] completed=%d limit=%d; stopping policy run",
+                        frames_this_run,
+                        max_run_frames,
+                    )
+                    _dispatch_halt(effective, runtime, session)
+                    has_sequential_policy = bool(
+                        runtime.policy is not None
+                        and runtime.policy_metadata
+                        and runtime.policy_metadata.get("sequential_chunks")
+                    )
+                    if has_sequential_policy:
+                        try:
+                            runtime.policy.reset()
+                        except Exception as error:
+                            session.last_error = (
+                                f"Stopped at frame limit; policy reset failed: {error}"
+                            )
+                            logger.exception("Could not reset stateful policy after frame limit")
+                    if not is_replay(runtime):
+                        discard_rollout_episode(runtime)
+                    continue
                 # Client-liveness watchdog: the frontend polls /api/status every second,
                 # so a stale timestamp means the operator's browser crashed or the network
                 # dropped. Halt the run rather than keep commanding the real robot blind.
@@ -1589,12 +1646,29 @@ def run(
                 set_phase(runtime, "ready")
                 runtime.needs_pre_start_reset = True
 
+            if (
+                runtime.policy_observation_trace is not None
+                and session.status is not SessionStatus.RUNNING
+            ):
+                try:
+                    runtime.policy_observation_trace.save()
+                except Exception:
+                    logger.exception("Could not write policy observation MSE report")
+                finally:
+                    runtime.policy_observation_trace = None
+
             if headless:
                 last_heartbeat = _maybe_log_heartbeat(runtime, session, last_heartbeat)
 
             loop_rate.sleep()
     finally:
         gc.callbacks.remove(log_gc_timing)
+        if runtime.policy_observation_trace is not None:
+            try:
+                runtime.policy_observation_trace.save()
+            except Exception:
+                logger.exception("Could not write policy observation MSE report on shutdown")
+            runtime.policy_observation_trace = None
         close_teleop(runtime)
         stop_collection_capture(runtime)
         close_rl_workspace(runtime)
@@ -1609,6 +1683,8 @@ def run(
             runtime.rollout_episode_logger.finalize()
         if runtime.infer_strategy is not None:
             runtime.infer_strategy.close()
+        if runtime.inference_observation_source is not None:
+            runtime.inference_observation_source.close()
         transport.close()
         if ssh_proc is not None:
             stop_ssh_forward(ssh_proc)

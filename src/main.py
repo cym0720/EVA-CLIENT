@@ -29,6 +29,11 @@ def parse_args() -> tuple[ConfigDict, int, str | None, bool]:
     parser.add_argument("--config", type=str, required=True, help="Path to .py configuration file")
     parser.add_argument("--web-port", type=int, default=8080, help="Web server port (default 8080)")
     parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Allow dataset-driven policy actions to publish to real robot hardware",
+    )
+    parser.add_argument(
         "--headless",
         action="store_true",
         help="Low-power mode: no web server; control over the ZMQ channel, status via logs",
@@ -36,6 +41,11 @@ def parse_args() -> tuple[ConfigDict, int, str | None, bool]:
     args = parser.parse_args()
 
     config = load_config(args.config)
+    observation_dataset = config.inference_cfg.get("observation_dataset")
+    if args.execute and observation_dataset is None:
+        parser.error("--execute requires inference_cfg.observation_dataset in the config")
+    if observation_dataset is not None:
+        observation_dataset["execute"] = bool(args.execute)
 
     return config, args.web_port, args.config, args.headless
 

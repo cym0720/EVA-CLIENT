@@ -270,7 +270,15 @@ def test_rl_policy_selection_waits_for_backend_confirmation_before_auto_setup():
 def test_rl_tab_does_not_force_generic_sim_mode_before_rl_setup():
     html = console_source()
 
-    assert 'S.ACTIVE_TAB !== "rl" && (!S.STATUS || !S.STATUS.cli_mode' in html
+    assert 'modeKnown && S.ACTIVE_TAB !== "rl" && S.STATUS.cli_mode === "select"' in html
+
+
+def test_console_boot_reads_backend_status_before_rendering_mode_defaults():
+    source = (STATIC_DIR / "js" / "main.js").read_text()
+
+    status_read = source.index('initialStatus = await apiGet("/api/status")')
+    render = source.index("renderConfig();", status_read)
+    assert status_read < render
 
 
 def test_rl_saved_data_render_is_keyed_instead_of_rebuilt_on_every_status_poll():

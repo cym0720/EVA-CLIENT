@@ -7,6 +7,9 @@ availability is config-driven — a deploy config lands on **DEBUG**, an eval
 config (`eval_cfg.checkpoints[]`) lands on **EVAL**; unrelated tabs are greyed
 out or read-only.
 
+For the G2 host's complete MANUAL and VR teleoperation setup, including USB
+headset connection and collection storage, see [G2 operation](agibot-g2-operation.md).
+
 **RL flow**
 
 | Tab       | Purpose                                                                                                             |

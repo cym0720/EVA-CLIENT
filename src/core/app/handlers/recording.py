@@ -331,6 +331,8 @@ def build_policy_observation(
             else state_to_eef(config, runtime, frame.state_qpos)
         )
     else:
+        # JointState 策略直接使用 transport 帧中拼接好的原始 qpos。
+        # 这里不会再次读取 GDK、查询图像缓存或归一化 state。
         state = frame.state_qpos
     return runtime.robot.build_observation(
         images=processed_images,

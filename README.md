@@ -126,6 +126,7 @@ Full guides live in [`docs/`](./docs). Start here:
 |-------|---------------|
 | [📦 Installation](./docs/installation.md) | Requirements, `uv` setup, hardware extras, verify |
 | [🚀 Quick start](./docs/quick-start.md) | Two-process bring-up, supported transports, deploy/eval/replay presets |
+| [G2 手动控制与 VR 遥操作](./docs/agibot-g2-operation.md) | G2 host setup, MANUAL, USB WebXR, controller gestures, and collection storage |
 | [🧭 Web console](./docs/console.md) | The seven tabs — MANUAL, COLLECT, REPLAY, DEBUG, RL, EVAL, RESULT |
 | [📚 Core concepts](./docs/concepts.md) | Transports, policy backends, inference strategies, robots, action spaces |
 | [⚙️ Configuration](./docs/configuration.md) | `_base_` inheritance, deep merge, startup pipeline |
@@ -197,3 +198,4 @@ vendored mmengine-style config system from
 [MMEngine](https://github.com/open-mmlab/mmengine).
 
 </details>
+# EVA-CLIENT

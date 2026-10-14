@@ -310,7 +310,20 @@ function activeWorkflowPanels() {
 
 let _prevSetupDone = false;
 
-function retrySetup() { S._setupFired = true; apiPost("/api/setup"); }
+function requestSetup() {
+    S._setupFired = true;
+    S._setupRequestError = "";
+    // SETUP only enqueues a command; its acknowledgement should be quick even
+    // while the robot moves. Never automatically retry an uncertain motion request.
+    apiPost("/api/setup", {}, { timeoutMs: 10000 }).then((reply) => {
+      if (!reply.ok) throw new Error(reply.error || "Setup request failed");
+    }).catch((error) => {
+      S._setupRequestError = String(error.message || error);
+      updateGuide();
+    });
+  }
+
+function retrySetup() { requestSetup(); updateGuide(); }
 
 function pauseSetup() {
     S._setupPaused = true;
@@ -357,7 +370,7 @@ function autoSetup(ready, done, errored) {
     const stage = (S.STATUS && S.STATUS.setup_stage) ? String(S.STATUS.setup_stage) : "";
     if (_prevSetupDone && !done) S._setupFired = false;
     _prevSetupDone = done;
-    if (done) { S._setupFired = true; S._setupPaused = false; renderSetupCtl(); if (msg) msg.textContent = "ROBOT READY"; return; }
+    if (done) { S._setupRequestError = ""; S._setupFired = true; S._setupPaused = false; renderSetupCtl(); if (msg) msg.textContent = "ROBOT READY"; return; }
     renderSetupCtl();
     if (S._setupPaused) { if (msg) msg.textContent = "PAUSED — CLICK RESUME"; return; }
     if (errored) {
@@ -367,7 +380,7 @@ function autoSetup(ready, done, errored) {
     }
     if (!ready) { S._setupFired = false; if (msg) msg.textContent = "AWAITING CONFIG…"; return; }
     if (stage) { if (msg) msg.textContent = "AUTO · " + stage.toUpperCase(); return; }
-    if (!S._setupFired) { S._setupFired = true; apiPost("/api/setup"); }
+    if (!S._setupFired) requestSetup();
     // Show the live setup sub-stage (connecting / resetting / warming up…) so the
     // user can see what setup is doing instead of an opaque spinner.
     if (msg) msg.textContent = stage ? ("AUTO · " + stage.toUpperCase()) : "AUTO · PREPARING ROBOT…";
@@ -506,7 +519,11 @@ function updateGuide() {
     setPanel(ids.config, hasConfig ? "done" : (hasPrompt ? "active" : "pending"));
     // A setup error (server unreachable) shows as a distinct failed state so the
     // spinner stops and RETRY is offered, instead of spinning forever.
-    const setupErrored = !setupDone && hasPrompt && hasConfig && !!s.last_error;
+    // A visible backend stage proves an uncertain request arrived. Otherwise
+    // surface its network error instead of leaving PREPARING latched forever.
+    if (setupDone || s.setup_stage) S._setupRequestError = "";
+    const setupRequestError = S._setupRequestError;
+    const setupErrored = !setupDone && hasPrompt && hasConfig && !!(s.last_error || setupRequestError);
     setPanel(ids.setup, setupDone ? "done" : (setupErrored ? "error" : (hasPrompt && hasConfig ? "active" : "pending")));
     setPanel(ids.control, setupDone ? "active" : "pending");
 
@@ -530,7 +547,7 @@ function updateGuide() {
     if (!hasPrompt) { step = 1; msg = `Step 1 — select ${pick} on the left`; }
     else if (!hasMode) { step = 2; msg = "Step 2 — pick a <b>MODE</b> under CONFIG"; }
     else if (!hasStrategy) { step = 2; msg = "Step 2 — pick a <b>STRATEGY</b> under CONFIG"; }
-    else if (setupErrored) { step = 3; msg = "Step 3 — <b>setup failed</b>"; hint = "Check the error, then click RETRY under SETUP"; }
+    else if (setupErrored) { step = 3; msg = "Step 3 — <b>setup failed</b>"; hint = setupRequestError || "Check the error, then click RETRY under SETUP"; }
     else if (!setupDone) {
       // Surface the live setup sub-stage (resetting / validating policy / warming up…)
       // straight in the banner so the operator sees what setup is doing, not an opaque spinner.
@@ -817,6 +834,16 @@ function renderModeButtons(listId) {
       b.onclick = () => {
         mark(listId, "mode", m);
         S.STATUS.cli_mode = m;
+        // A mode switch resets backend setup state. Re-arm auto-setup and clear
+        // the old mode's optimistic status before updateGuide() runs; otherwise
+        // a missed ready poll can leave _setupFired latched and REAL setup never
+        // gets posted after switching from SIM.
+        S._setupFired = false;
+        S._setupPaused = false;
+        S._setupRequestError = "";
+        S.STATUS.is_setup_done = false;
+        S.STATUS.setup_stage = "";
+        S.STATUS.last_error = "";
         apiPost("/api/select_mode", { mode: m });
         updateGuide();
       };
@@ -932,13 +959,14 @@ function renderConfig() {
     // a directly-entered eval runs on the real arm, instead of the SIM fallback below
     // which (when STATUS is still empty at boot) would silently run trials in SIM — no
     // real-arm motion, instant reset — until a model A->B switch re-selected REAL.
-    if (evalEnabled()) {
+    const modeKnown = !!(S.STATUS && S.STATUS.cli_mode);
+    if (modeKnown && evalEnabled()) {
       const wantMode = evalCfg().cli_mode || "real";
       if ((!S.STATUS || !S.STATUS.cli_mode || S.STATUS.cli_mode === "select") && S.CFG.modes.includes(wantMode)) {
         if (S.STATUS) S.STATUS.cli_mode = wantMode;
         apiPost("/api/select_mode", { mode: wantMode });
       }
-    } else if (S.ACTIVE_TAB !== "rl" && (!S.STATUS || !S.STATUS.cli_mode || S.STATUS.cli_mode === "select") && S.CFG.modes.includes("sim")) {
+    } else if (modeKnown && S.ACTIVE_TAB !== "rl" && S.STATUS.cli_mode === "select" && S.CFG.modes.includes("sim")) {
       // SIM is the default run mode for the plain console tabs.
       if (S.STATUS) S.STATUS.cli_mode = "sim";
       apiPost("/api/select_mode", { mode: "sim" });

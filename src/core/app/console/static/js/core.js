@@ -74,6 +74,7 @@ export const S = {
   _setupFired: false,
   _replayModePushed: false,
   _setupPaused: false,
+  _setupRequestError: "",
   replayLoadPending: false,
   replaySeriesKey: null,
   chartModalWhich: null,
@@ -196,17 +197,24 @@ async function apiGet(path, { timeoutMs = API_GET_TIMEOUT_MS, signal = null } = 
 }
 
 let postQueue = Promise.resolve();
+const ENQUEUE_PATHS = new Set([
+  "/api/setup", "/api/select_mode", "/api/select_task", "/api/select_strategy",
+  "/api/connect", "/api/disconnect", "/api/run", "/api/halt", "/api/tab_switch",
+]);
 
-async function apiPost(path, body, { concurrent = false } = {}) {
+async function apiPost(path, body, { concurrent = false, timeoutMs = ENQUEUE_PATHS.has(path) ? 10000 : 0 } = {}) {
   const request = async () => {
     const traceId = `${CLIENT_TRACE_ID}:${clientTraceSeq + 1}`;
     const started = performance.now();
+    const controller = timeoutMs > 0 ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
     clientTrace("api.post.begin", { path }, traceId);
     try {
       const r = await fetch(path, {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-EVA-Trace-ID": traceId },
         body: JSON.stringify(body || {}),
+        ...(controller ? { signal: controller.signal } : {}),
       });
       const payload = await r.json();
       clientTrace("api.post.end", {
@@ -218,12 +226,17 @@ async function apiPost(path, body, { concurrent = false } = {}) {
       }, traceId);
       return payload;
     } catch (error) {
+      if (controller && controller.signal.aborted) {
+        error = new Error(`Request timed out (${path}); check connection and robot status before retrying`);
+      }
       clientTrace("api.post.error", {
         path,
         message: String(error),
         elapsed_ms: Math.round((performance.now() - started) * 10) / 10,
       }, traceId);
       throw error;
+    } finally {
+      if (timer !== null) clearTimeout(timer);
     }
   };
   if (concurrent) return request();
